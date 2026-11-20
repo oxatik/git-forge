@@ -10,7 +10,9 @@
 //      entry already registered, and this process keeps waiting like any other.
 //   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
 //      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
+//      is retried with a short exponential backoff; the process never exits before the env says done
+//      unless the env itself hangs, in which case a wall-clock fallback exits 0 at the trial's wall
+//      budget so the harness can stop the env and score what was served.
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
@@ -29,6 +31,8 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** The first wait between retries, and the longest. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
+/** A self-imposed wall-clock fallback: if the env never says done, exit 0 instead of hanging. */
+const WALL_FALLBACK_MS = 900_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -90,7 +94,18 @@ async function main(): Promise<void> {
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
+  // The trial's wall budget is 900 seconds; if the env hangs past it, leave cleanly instead of
+  // holding the trial open. unref(): the timer must never hold the process open by itself — the
+  // normal path clears it below.
+  const wallFallback = setTimeout(() => {
+    process.stderr.write('[entry] wall-clock fallback reached: the env never said done, exiting 0\n');
+    server.close();
+    process.exit(0);
+  }, WALL_FALLBACK_MS);
+  wallFallback.unref();
+
   await waitForDone();
+  clearTimeout(wallFallback);
   server.close();
   process.stdout.write('[entry] done\n');
 }
