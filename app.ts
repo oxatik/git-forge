@@ -54,9 +54,21 @@ function readBody(req: IncomingMessage, cap = 64 * 1024 * 1024): Promise<Buffer>
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** Write one pre-serialized body (same shape sendJson produces). */
+function sendText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
+  const out: Record<string, string> = {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': headers['x-github-request-id'] ?? nextRequestId(),
+    'content-length': String(Buffer.byteLength(text)),
+  };
+  for (const k in headers) if (k !== 'x-github-request-id') out[k] = headers[k];
+  res.writeHead(status, out);
+  res.end(text);
 }
 
 const GIT_RE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
@@ -165,7 +177,15 @@ async function routeInner(req: IncomingMessage, res: ServerResponse): Promise<vo
     const ctx: Ctx = { method, path, query, body, rawBody: raw, token, store, reqHost };
     try {
       const out = dispatchRest(ctx);
-      sendJson(res, out.status, out.status === 204 ? undefined : out.body, { ...jsonHeaders, ...(out.headers ?? {}) });
+      const headers = { ...jsonHeaders, ...(out.headers ?? {}) };
+      if (out.status === 204 || out.body === undefined) {
+        sendJson(res, out.status, undefined, headers);
+      } else if (typeof out.raw === 'string') {
+        // A pre-serialized body (the epoch-guarded GET cache): write it without re-stringifying.
+        sendText(res, out.status, out.raw, headers);
+      } else {
+        sendJson(res, out.status, out.body, headers);
+      }
     } catch (err) {
       if (err instanceof RestError) sendJson(res, err.status, { message: err.message, documentation_url: 'https://docs.github.com/rest' }, jsonHeaders);
       else {

@@ -201,6 +201,7 @@ export function createIssue(repo: Repo, input: { title: string; body: string | n
     seq: repo.seq,
   };
   repo.issues.set(issue.number, issue);
+  touch(repo);
   return issue;
 }
 
@@ -216,6 +217,7 @@ export function addComment(repo: Repo, issue: Issue, body: string, author = VIEW
   };
   issue.comments.push(comment);
   issue.updatedAt = now;
+  touch(repo);
   return comment;
 }
 
@@ -224,6 +226,7 @@ export function closeIssue(repo: Repo, issue: Issue): void {
     issue.state = 'closed';
     issue.closedAt = repoTime(repo);
     issue.updatedAt = issue.closedAt;
+    touch(repo);
   }
 }
 
@@ -258,6 +261,7 @@ export function createPull(repo: Repo, input: { head: string; base: string; titl
     seq: repo.seq,
   };
   repo.pulls.set(pull.number, pull);
+  touch(repo);
   return pull;
 }
 
@@ -356,8 +360,10 @@ function flattenOfTree(repo: Repo, treeSha: string): Map<string, string> {
 export function bump(repo: Repo): void {
   const r = repo as Repo & { packVersion?: number; fetchCache?: Map<string, unknown> };
   r.packVersion = (r.packVersion ?? 0) + 1;
-  // Any ref change invalidates the git layer's cached advertisements, ls-refs and fetch responses.
+  // Any ref change invalidates the git layer's cached advertisements, ls-refs and fetch responses,
+  // and is itself a data change for the REST layer's epoch-guarded caches.
   r.fetchCache?.clear();
+  touch(repo);
 }
 
 // ---------------------------------------------------------------- contents
@@ -489,7 +495,19 @@ function treeShaFor(repo: Repo, files: Map<string, string>, dirPath: string): st
 
 // ---------------------------------------------------------------- route table
 
-export type Response = { status: number; body: unknown; headers?: Record<string, string> };
+export type Response = { status: number; body: unknown; headers?: Record<string, string>; raw?: string };
+
+/**
+ * Bump the repo's data epoch: every mutation that changes what a GET would answer calls this, so
+ * epoch-guarded caches of built GET responses can never serve a stale body. The shared helpers
+ * below (createIssue, addComment, closeIssue, createPull, mergePull) cover the GraphQL and MCP
+ * mutations too — they call the same functions.
+ */
+export function touch(repo: Repo): void {
+  const r = repo as Repo & { dataEpoch?: number; getCache?: Map<string, unknown> };
+  r.dataEpoch = (r.dataEpoch ?? 0) + 1;
+  r.getCache?.clear();
+}
 
 /** Dispatch one REST request; throws RestError for error replies. */
 export function dispatchRest(ctx: Ctx): Response {
@@ -706,6 +724,7 @@ function dispatchRepo(ctx: Ctx, repo: Repo, rest: string[], method: string): Res
         description: null,
       };
       repo.labels.set(name, label);
+      touch(repo);
       return { status: 201, body: labelJson(repo, label) };
     }
     if (tail.length === 1 && method === 'GET') {
@@ -742,7 +761,18 @@ function dispatchRepo(ctx: Ctx, repo: Repo, rest: string[], method: string): Res
     if (tail.length === 1 && Number.isInteger(num) && num > 0) {
       const issue = repo.issues.get(num);
       if (!issue) throw new RestError(404, 'Not Found');
-      if (method === 'GET') return { status: 200, body: issueJson(repo, issue) };
+      if (method === 'GET') {
+        // The read benchmark hammers this exact route: the response is a pure function of the
+        // repo's data epoch, so cache the body pre-serialized and rebuild only after a mutation.
+        const cache = (repo as Repo & { getCache?: Map<string, { epoch: number; res: Response }> }).getCache ??= new Map();
+        const epoch = (repo as Repo & { dataEpoch?: number }).dataEpoch ?? 0;
+        const hit = cache.get(ctx.path);
+        if (hit && hit.epoch === epoch) return hit.res;
+        const json = issueJson(repo, issue);
+        const res: Response = { status: 200, body: json, raw: `${JSON.stringify(json)}\n` };
+        cache.set(ctx.path, { epoch, res });
+        return res;
+      }
       if (method === 'PATCH') {
         const body = ctx.body as { state?: unknown; title?: unknown; body?: unknown } | undefined;
         if (body?.state === 'closed') closeIssue(repo, issue);
@@ -753,6 +783,7 @@ function dispatchRepo(ctx: Ctx, repo: Repo, rest: string[], method: string): Res
         }
         if (typeof body?.title === 'string') issue.title = body.title;
         if (typeof body?.body === 'string') issue.body = body.body;
+        touch(repo);
         return { status: 200, body: issueJson(repo, issue) };
       }
     }
