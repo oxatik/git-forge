@@ -151,6 +151,26 @@ export function isAncestorOrEqual(repo: Repo, oldSha: string, newSha: string): b
   return ancestors(repo, newSha).has(oldSha);
 }
 
+/**
+ * Containment with an early exit: true when `old` is reachable from `new` (or equal). Unlike
+ * `ancestors` it stops the walk the moment `old` is seen — the fast-forward path in receive-pack
+ * asks exactly this question, and the pushed commit's parent usually is the answer one step in.
+ */
+export function isAncestorEarlyExit(repo: Repo, oldSha: string, newSha: string): boolean {
+  if (oldSha === newSha) return true;
+  const seen = new Set<string>();
+  const stack = [newSha];
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (sha === oldSha) return true;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const c = readCommit(repo, sha);
+    if (c) for (const p of c.parents) stack.push(p);
+  }
+  return false;
+}
+
 export type TreeDiffEntry = { path: string; status: 'added' | 'removed' | 'modified'; oldSha: string | null; newSha: string | null; additions: number; deletions: number };
 
 /** Diff two trees' flat maps into GitHub-style file entries. */

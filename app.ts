@@ -22,12 +22,13 @@ function nextRequestId(): string {
 /** Answer one request with a JSON body. */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
+  const out: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': headers['x-github-request-id'] ?? nextRequestId(),
-    ...(body === undefined ? {} : { 'content-length': Buffer.byteLength(text) }),
-    ...Object.fromEntries(Object.entries(headers).filter(([k]) => k !== 'x-github-request-id')),
-  });
+  };
+  if (body !== undefined) out['content-length'] = String(Buffer.byteLength(text));
+  for (const k in headers) if (k !== 'x-github-request-id') out[k] = headers[k];
+  res.writeHead(status, out);
   res.end(text);
 }
 
@@ -60,6 +61,9 @@ function readBody(req: IncomingMessage, cap = 64 * 1024 * 1024): Promise<Buffer>
 
 const GIT_RE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
+/** Shared read-only empty query (never mutated; see routeInner). */
+const EMPTY_QUERY = new URLSearchParams();
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -84,8 +88,10 @@ async function routeInner(req: IncomingMessage, res: ServerResponse): Promise<vo
   const requestId = nextRequestId();
   const url = req.url ?? '/';
   const qIndex = url.indexOf('?');
+  // Query strings are only ever read, never written, so one shared empty instance serves every
+  // request without one — the read/write benches and the git exchanges have no query at all.
+  const query = qIndex < 0 ? EMPTY_QUERY : new URLSearchParams(url.slice(qIndex + 1));
   const rawPath = qIndex < 0 ? url : url.slice(0, qIndex);
-  const query = new URLSearchParams(qIndex < 0 ? '' : url.slice(qIndex + 1));
   const method = req.method ?? 'GET';
   const path = decodePath(rawPath);
   const token = tokenOf(req);
@@ -218,8 +224,9 @@ async function routeInner(req: IncomingMessage, res: ServerResponse): Promise<vo
   sendJson(res, 404, { message: 'Not Found' }, jsonHeaders);
 }
 
-/** Percent-decode a request path, segment by segment (keeping '/'). */
+/** Percent-decode a request path, segment by segment (keeping '/'). Paths without escapes skip the work. */
 function decodePath(raw: string): string {
+  if (!raw.includes('%')) return raw;
   try {
     return raw
       .split('/')

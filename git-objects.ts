@@ -188,34 +188,20 @@ export type ParsedObject =
   | { kind: 'ref-delta'; start: number; end: number; base: string; delta: Buffer };
 
 /**
- * Inflate the zlib stream that begins at `start` and report the offset just past it.
- * Packfiles store only the uncompressed size, so the stream's end is found by search:
- * inflateSync succeeds exactly when the slice covers the whole stream, which is monotonic
- * in the slice length — a binary search over a tight bound finds it in a few inflates.
+ * Inflate the zlib stream that begins at `start` and report the offset just past it. Packfiles
+ * store only the uncompressed size, so the stream's end must be measured: one inflate over the
+ * rest of the pack answers it — zlib stops at the stream's end and the engine reports how many
+ * input bytes it consumed (engine.bytesWritten on Node 22+; older engines carry the same count
+ * as bytesRead). No search, one pass per object.
  */
 function inflateAt(pack: Buffer, start: number, uncompressedSize: number): { data: Buffer; end: number } {
-  const remaining = pack.length - start;
-  // Deflate's worst case is ~5 extra bytes per 16 KiB stored block plus the header;
-  // the bound is generous but keeps the search slices small.
-  const bound = Math.min(remaining, uncompressedSize + 128 + (uncompressedSize >> 8));
-  let lo = Math.min(8, bound);
-  let hi = bound;
-  let data: Buffer | null = null;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      data = inflateSync(pack.subarray(start, start + mid));
-      hi = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  try {
-    data = inflateSync(pack.subarray(start, start + lo));
-  } catch {
+  void uncompressedSize;
+  const res = inflateSync(pack.subarray(start), { info: true }) as { buffer: Buffer; engine: { bytesWritten?: number; bytesRead?: number } };
+  const consumed = typeof res.engine.bytesWritten === 'number' ? res.engine.bytesWritten : res.engine.bytesRead;
+  if (typeof consumed !== 'number' || consumed <= 0 || start + consumed > pack.length) {
     throw new Error(`bad zlib stream at offset ${start}`);
   }
-  return { data, end: start + lo };
+  return { data: res.buffer, end: start + consumed };
 }
 
 /**

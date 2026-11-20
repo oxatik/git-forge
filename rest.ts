@@ -354,8 +354,10 @@ function flattenOfTree(repo: Repo, treeSha: string): Map<string, string> {
 }
 
 export function bump(repo: Repo): void {
-  const r = repo as Repo & { packVersion?: number };
+  const r = repo as Repo & { packVersion?: number; fetchCache?: Map<string, unknown> };
   r.packVersion = (r.packVersion ?? 0) + 1;
+  // Any ref change invalidates the git layer's cached advertisements, ls-refs and fetch responses.
+  r.fetchCache?.clear();
 }
 
 // ---------------------------------------------------------------- contents
@@ -492,7 +494,9 @@ export type Response = { status: number; body: unknown; headers?: Record<string,
 /** Dispatch one REST request; throws RestError for error replies. */
 export function dispatchRest(ctx: Ctx): Response {
   const seg = ctx.path.replace(/^\/api\/v3\/?/, '');
-  const parts = seg.split('/').filter((p) => p.length > 0).map((p) => decodeURIComponent(p));
+  const parts = seg.split('/').filter((p) => p.length > 0);
+  // Segment decoding only matters for percent escapes; the bench and git paths carry none.
+  if (seg.includes('%')) for (let i = 0; i < parts.length; i++) parts[i] = decodeURIComponent(parts[i]);
   const method = ctx.method;
 
   // Repos in the store are keyed owner/name; the viewer's login owns everything created via /user/repos.

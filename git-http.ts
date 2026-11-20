@@ -13,7 +13,7 @@ import {
 } from './git-objects.ts';
 import { createHash } from 'node:crypto';
 import { sha1Loose, putObject, type Repo } from './store.ts';
-import { readCommit, ancestors, getObject } from './treeops.ts';
+import { readCommit, isAncestorEarlyExit, getObject } from './treeops.ts';
 import { decodeTag } from './git-objects.ts';
 
 const ZERO_OID = '0'.repeat(40);
@@ -118,20 +118,44 @@ function advertiseV0(repo: Repo, service: 'upload' | 'receive'): Buffer {
 
 /** GET /<owner>/<repo>.git/info/refs?service=… */
 export function infoRefs(repo: Repo, service: string, protocolV2: boolean): { contentType: string; body: Buffer } {
-  if (service === 'git-upload-pack') {
-    if (protocolV2) return { contentType: 'application/x-git-upload-pack-advertisement', body: advertiseV2(repo) };
-    return { contentType: 'application/x-git-upload-pack-advertisement', body: advertiseV0(repo, 'upload') };
+  const kind = service === 'git-upload-pack' ? (protocolV2 ? 'up2' : 'up0') : service === 'git-receive-pack' ? 'rp' : null;
+  if (kind === null) throw new GitHttpError('bad service', 400);
+  const contentType = kind === 'rp' ? 'application/x-git-receive-pack-advertisement' : 'application/x-git-upload-pack-advertisement';
+  // The advertisement depends only on the refs (and the default branch), both captured by the
+  // repo's pack version: cache the bytes so repeated exchanges skip the rebuild.
+  const cache = repoCache(repo);
+  const key = `adv|${kind}|v${packVersionOf(repo)}`;
+  let body = cache.get(key);
+  if (!body) {
+    body = kind === 'rp' ? advertiseV0(repo, 'receive') : protocolV2 ? advertiseV2(repo) : advertiseV0(repo, 'upload');
+    cache.set(key, body);
   }
-  if (service === 'git-receive-pack') {
-    return { contentType: 'application/x-git-receive-pack-advertisement', body: advertiseV0(repo, 'receive') };
-  }
-  throw new GitHttpError('bad service', 400);
+  return { contentType, body };
 }
 
 // ---------------------------------------------------------------- ls-refs (v2)
 
+/** The repo's cache of rebuilt git protocol responses; every entry is keyed by the pack version. */
+type RepoGitCache = Map<string, Buffer>;
+function repoCache(repo: Repo): RepoGitCache {
+  return ((repo as Repo & { fetchCache?: Map<string, unknown> }).fetchCache ??= new Map()) as RepoGitCache;
+}
+function packVersionOf(repo: Repo): number {
+  return (repo as Repo & { packVersion?: number }).packVersion ?? 0;
+}
+
 /** Handle a v2 ls-refs request body. */
 export function lsRefs(repo: Repo, body: Buffer): Buffer {
+  const cache = repoCache(repo);
+  const key = `ls|${body.toString('latin1')}|v${packVersionOf(repo)}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const built = lsRefsBuild(repo, body);
+  cache.set(key, built);
+  return built;
+}
+
+function lsRefsBuild(repo: Repo, body: Buffer): Buffer {
   const prefixes: string[] = [];
   let wantPeel = false;
   let symrefs = false;
@@ -430,6 +454,11 @@ function computeSendSet(repo: Repo, req: FetchRequest): { objects: Array<{ type:
 
 /** Build the v2 fetch response (sections: acknowledgments, shallow-info, packfile). */
 function fetchV2(repo: Repo, req: FetchRequest, packCacheKey: string): Buffer {
+  // The whole response is a pure function of (repo version, request): cache the bytes.
+  const cache = repoCache(repo);
+  const key = `resp|${packCacheKey}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
   const parts: Buffer[] = [];
   parts.push(pkt('acknowledgments\n'), pkt('NAK\n'), FLUSH_PKT);
   const { objects, shallowOut, unshallowOut } = sendSetCached(repo, req, packCacheKey);
@@ -443,11 +472,17 @@ function fetchV2(repo: Repo, req: FetchRequest, packCacheKey: string): Buffer {
   const pack = buildPack(objects);
   parts.push(...band1Chunks(pack));
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  cache.set(key, out);
+  return out;
 }
 
 /** Build the v0 fetch response (shallow/unshallow lines, NAK, sideband pack). */
 function fetchV0(repo: Repo, req: FetchRequest, packCacheKey: string): Buffer {
+  const cache = repoCache(repo);
+  const key = `resp|${packCacheKey}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
   const parts: Buffer[] = [];
   const { objects, shallowOut, unshallowOut } = sendSetCached(repo, req, packCacheKey);
   for (const s of shallowOut) parts.push(pkt(`shallow ${s}\n`));
@@ -456,7 +491,9 @@ function fetchV0(repo: Repo, req: FetchRequest, packCacheKey: string): Buffer {
   const pack = buildPack(objects);
   parts.push(...band1Chunks(pack));
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  cache.set(key, out);
+  return out;
 }
 
 /** The cached send-set: the same fetch against the same repo version reuses its result. */
@@ -616,10 +653,11 @@ export function handleReceivePack(repo: Repo, body: Buffer): { contentType: stri
       } else if (current !== cmd.oldSha) {
         verdict = { ok: false, reason: 'fetch first' };
       } else {
-        // Fast-forward check: the old commit must be an ancestor of the new one.
+        // Fast-forward check: the old commit must be an ancestor of the new one (walk exits as
+        // soon as the old commit is seen — the pushed commit's parent usually answers at once).
         const oldObj = repo.objects.get(cmd.oldSha);
         const newObj = repo.objects.get(cmd.newSha);
-        if (oldObj && newObj && oldObj.type === 'commit' && newObj.type === 'commit' && !ancestors(repo, cmd.newSha).has(cmd.oldSha)) {
+        if (oldObj && newObj && oldObj.type === 'commit' && newObj.type === 'commit' && !isAncestorEarlyExit(repo, cmd.oldSha, cmd.newSha)) {
           verdict = { ok: false, reason: 'non-fast-forward' };
         } else {
           repo.refs.set(cmd.ref, cmd.newSha);
